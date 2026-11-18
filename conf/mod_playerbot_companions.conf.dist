@@ -1,0 +1,10 @@
+[worldserver]
+
+# Dedicated database connection in the format "host;port;user;password;database".
+# An empty value reuses the CharacterDatabaseInfo connection with the database
+# name changed to acore_playerbot_companions.
+PlayerbotCompanions.DatabaseInfo = ""
+
+# Apply the module's SQL migrations on worldserver startup.
+# Creating a missing database also requires Updates.AutoSetup.
+PlayerbotCompanions.DatabaseUpdates = 1

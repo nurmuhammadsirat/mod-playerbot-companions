@@ -1,8 +1,8 @@
 # Playerbot Companions
 
-Version 0.1 lets each player character keep a persistent roster of existing playerbots. Bring a bot into
-your party through Playerbots, then recruit it with `.companion add`. The roster lives in its own MySQL
-database and survives worldserver restarts.
+Each player character can keep a persistent roster of existing playerbots. Bring a bot into your party
+through Playerbots, then recruit it with `.companion add`. The roster and each companion's loyalty live
+in a dedicated MySQL database and survive worldserver restarts.
 
 ## Dependencies
 
@@ -50,7 +50,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER ON `acore_playerbot_companio
 ```
 
 For manual setup, create the dedicated database and run the files in
-`data/sql/playerbot_companions/updates/` against it in filename order. Set
+`data/sql/playerbot_companions/updates/` against it in filename order. When upgrading an existing
+installation, apply only migrations that have yet to run. Set
 `PlayerbotCompanions.DatabaseUpdates = 0` and grant the configured account `SELECT`, `INSERT`,
 `UPDATE`, and `DELETE` on the companion table. Use a different companion database for each realm
 that has its own character database, and back up the two databases together.
@@ -61,10 +62,28 @@ Worldserver stops during startup if it cannot open or initialize the companion d
 
 - `.companion add [name]` recruits an online bot in your group. Omit the name to use your selected target.
 - `.companion list` shows this character’s recruits and whether each is in your group, online as a bot, or unavailable.
+- `.companion info <name>` shows the companion's current loyalty and relationship tier, even when the bot is offline.
 - `.companion dismiss [name]` removes a recruited bot from your current party or raid. Omit the name to
   use your selected target. You need normal group removal permissions.
 - `.companion remove <name or character ID>` erases the relationship, even if the bot is offline.
   Use the displayed numeric ID if a listed character has become unavailable. The bot can stay in your party.
+
+## Loyalty
+
+Each recruit starts at zero. Spending five minutes within 100 yards of a recruited bot while grouped
+earns five loyalty, up to 100. Both characters must be in the same map and phase, and the player must
+be connected and free of the AFK flag. Dungeon Finder groups qualify. Battleground and battlefield
+groups are excluded.
+
+A gap under two minutes pauses the clock and counts as part of the same session. At two minutes apart,
+a future reunion starts a fresh session. Once a session qualifies, it earns five points total and keeps
+the last shared activity time current while you stay together. If worldserver restarts before the session
+qualifies, the five-minute timer starts again. Earned loyalty is persistent.
+
+After seven inactive days, the relationship loses one loyalty point per additional full day, even
+while you are offline. It stays on your roster at zero. The tiers are Newly recruited (0–19), Familiar
+(20–49), Trusted (50–79), and Devoted (80–100). Tiers are visible in `.companion info` and are
+descriptive in this release.
 
 ## In-game verification
 
@@ -79,6 +98,12 @@ Worldserver stops during startup if it cannot open or initialize the companion d
 5. Run `.companion remove BotName` while the bot is offline. Check that the record is gone and stays
    gone after a restart. If you recruit and remove a bot while it is still in your party, verify that the
    bot remains in the party.
+6. Check `.companion info BotName` for a new recruit. It should show zero. Stay grouped and close for
+   five minutes, then check for five points. Dismiss and rejoin within two minutes to verify that it
+   stays at five. Spend at least two minutes apart and qualify a new session to reach ten.
+7. Restart worldserver and check `.companion info BotName` again. On a disposable test database,
+   set that relationship's `last_shared_at` to eight days ago (Unix time in seconds) and confirm that
+   the displayed score drops by one.
 
 ## Limitations
 

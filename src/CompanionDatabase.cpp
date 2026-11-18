@@ -4,6 +4,7 @@
 #include "DBUpdater.h"
 #include "DatabaseEnv.h"
 #include "DatabaseScript.h"
+#include "Duration.h"
 #include "Log.h"
 #include "MySQLPreparedStatement.h"
 #include "Util.h"
@@ -11,6 +12,19 @@
 
 namespace Acore::PlayerbotCompanions
 {
+namespace
+{
+constexpr int MaxLoyalty = 100;
+constexpr int SessionLoyalty = 5;
+constexpr int GraceDays = 7;
+
+std::string DecayedLoyalty(std::string_view now)
+{
+    return Acore::StringFormat("GREATEST(0, CAST(loyalty AS SIGNED) - GREATEST(0, "
+        "({} - last_shared_at) DIV {} - {}))", now, Seconds(24h).count(), GraceDays);
+}
+}
+
 class CompanionConnection : public MySQLConnection
 {
 public:
@@ -25,6 +39,7 @@ private:
         PrepareStatement(COMPANION_INS_RELATIONSHIP,
             "INSERT INTO playerbot_companions (owner_guid, owner_created_at, bot_guid, bot_created_at) "
             "VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE "
+            "loyalty = IF(bot_created_at = ?, loyalty, 0), last_shared_at = IF(bot_created_at = ?, last_shared_at, 0), "
             "recruited_at = IF(bot_created_at = ?, recruited_at, CURRENT_TIMESTAMP), bot_created_at = ?",
             CONNECTION_ASYNC);
         // A NULL row distinguishes an empty roster from a failed query.
@@ -33,12 +48,23 @@ private:
             "SELECT bot_guid, bot_created_at FROM playerbot_companions "
             "WHERE owner_guid = ? AND owner_created_at = ? ORDER BY bot_guid", CONNECTION_ASYNC);
         PrepareStatement(COMPANION_SEL_RELATIONSHIP,
-            "SELECT CAST(EXISTS (SELECT 1 FROM playerbot_companions "
-            "WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ? AND bot_created_at = ?) AS SIGNED)",
+            "SELECT CAST(MAX(UNIX_TIMESTAMP(recruited_at)) AS SIGNED) FROM playerbot_companions "
+            "WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ? AND bot_created_at = ?",
             CONNECTION_ASYNC);
         PrepareStatement(COMPANION_DEL_RELATIONSHIP,
             "DELETE FROM playerbot_companions WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ?",
             CONNECTION_ASYNC);
+        PrepareStatement(COMPANION_SEL_INFO,
+            Acore::StringFormat("SELECT MAX(bot_created_at), CAST(COALESCE(MAX({}), 0) AS SIGNED) "
+                "FROM playerbot_companions WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ?",
+                DecayedLoyalty("?")), CONNECTION_ASYNC);
+        // Once last_shared_at advances past the session cutoff, later saves and retries can only refresh it.
+        PrepareStatement(COMPANION_UPD_LOYALTY,
+            Acore::StringFormat("UPDATE playerbot_companions "
+                "SET loyalty = LEAST({}, {} + IF(last_shared_at <= ?, {}, 0)), last_shared_at = ? "
+                "WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ? AND bot_created_at = ? "
+                "AND last_shared_at < ? AND UNIX_TIMESTAMP(recruited_at) = ?",
+                MaxLoyalty, DecayedLoyalty("?"), SessionLoyalty), CONNECTION_ASYNC);
     }
 };
 

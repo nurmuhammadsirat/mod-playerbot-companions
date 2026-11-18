@@ -18,6 +18,14 @@ constexpr int MaxLoyalty = 100;
 constexpr int SessionLoyalty = 5;
 constexpr int GraceDays = 7;
 
+constexpr std::string_view InsertMemory =
+    "INSERT INTO playerbot_companion_memories "
+    "(owner_guid, owner_created_at, bot_guid, bot_created_at, memory_type, "
+    "map_id, instance_id, difficulty, subject_id, occurred_at, summary) "
+    "SELECT owner_guid, owner_created_at, bot_guid, bot_created_at, {}, ?, ?, ?, ?, ?, ? FROM playerbot_companions "
+    "WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ? AND bot_created_at = ? "
+    "{} ON DUPLICATE KEY UPDATE id = playerbot_companion_memories.id";
+
 std::string DecayedLoyalty(std::string_view now)
 {
     return Acore::StringFormat("GREATEST(0, CAST(loyalty AS SIGNED) - GREATEST(0, "
@@ -52,11 +60,18 @@ private:
             "WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ? AND bot_created_at = ?",
             CONNECTION_ASYNC);
         PrepareStatement(COMPANION_DEL_RELATIONSHIP,
-            "DELETE FROM playerbot_companions WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ?",
+            "DELETE c, m FROM playerbot_companions AS c LEFT JOIN playerbot_companion_memories AS m "
+            "ON m.owner_guid = c.owner_guid AND m.owner_created_at = c.owner_created_at AND m.bot_guid = c.bot_guid "
+            "WHERE c.owner_guid = ? AND c.owner_created_at = ? AND c.bot_guid = ?",
             CONNECTION_ASYNC);
         PrepareStatement(COMPANION_SEL_INFO,
-            Acore::StringFormat("SELECT MAX(bot_created_at), CAST(COALESCE(MAX({}), 0) AS SIGNED) "
-                "FROM playerbot_companions WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ?",
+            Acore::StringFormat("SELECT c.bot_created_at, CAST({} AS SIGNED), m.occurred_at, m.summary "
+                "FROM (SELECT CAST(? AS UNSIGNED) AS owner_guid, CAST(? AS SIGNED) AS owner_created_at, "
+                "CAST(? AS UNSIGNED) AS bot_guid) AS requested "
+                "LEFT JOIN playerbot_companions AS c USING (owner_guid, owner_created_at, bot_guid) "
+                "LEFT JOIN playerbot_companion_memories AS m ON m.owner_guid = c.owner_guid "
+                "AND m.owner_created_at = c.owner_created_at AND m.bot_guid = c.bot_guid "
+                "AND m.bot_created_at = c.bot_created_at ORDER BY m.occurred_at DESC, m.id DESC LIMIT 5",
                 DecayedLoyalty("?")), CONNECTION_ASYNC);
         // Once last_shared_at advances past the session cutoff, later saves and retries can only refresh it.
         PrepareStatement(COMPANION_UPD_LOYALTY,
@@ -65,6 +80,12 @@ private:
                 "WHERE owner_guid = ? AND owner_created_at = ? AND bot_guid = ? AND bot_created_at = ? "
                 "AND last_shared_at < ? AND UNIX_TIMESTAMP(recruited_at) = ?",
                 MaxLoyalty, DecayedLoyalty("?"), SessionLoyalty), CONNECTION_ASYNC);
+        // The adventure insert precedes the loyalty update in the same transaction.
+        PrepareStatement(COMPANION_INS_ADVENTURE_MEMORY, Acore::StringFormat(InsertMemory, "'adventure'",
+            "AND last_shared_at <= ? AND last_shared_at < ? AND UNIX_TIMESTAMP(recruited_at) = ?"),
+            CONNECTION_ASYNC);
+        PrepareStatement(COMPANION_INS_ENCOUNTER_MEMORY, Acore::StringFormat(InsertMemory, "?", ""),
+            CONNECTION_ASYNC);
     }
 };
 

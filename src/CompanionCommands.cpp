@@ -4,6 +4,7 @@
 #include "ChatCommandTags.h"
 #include "CommandScript.h"
 #include "CompanionDatabase.h"
+#include "CompanionSocial.h"
 #include "Creature.h"
 #include "DBCStores.h"
 #include "Field.h"
@@ -11,7 +12,9 @@
 #include "GlobalScript.h"
 #include "Group.h"
 #include "GroupReference.h"
+#include "InstanceScript.h"
 #include "Map.h"
+#include "MapMgr.h"
 #include "MapReference.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -22,6 +25,7 @@
 #include "PlayerbotOperations.h"
 #include "QueryCallback.h"
 #include "QueryResult.h"
+#include "Random.h"
 #include "Timer.h"
 #include "Transaction.h"
 #include "WorldScript.h"
@@ -29,11 +33,11 @@
 #include "WorldSessionMgr.h"
 #include <functional>
 #include <map>
+#include <mutex>
+#include <set>
 #include <tuple>
 
 namespace Acore::PlayerbotCompanions
-{
-namespace
 {
 using namespace ChatCommands;
 
@@ -41,30 +45,22 @@ using namespace ChatCommands;
 AsyncCallbackProcessor<QueryCallback> QueryCallbacks;
 AsyncCallbackProcessor<TransactionCallback> WriteCallbacks;
 
-struct CharacterIdentity
+CharacterIdentity::CharacterIdentity(Player const& player)
+    : Guid(player.GetGUID()), CreatedAt(player.GetCreationTime().count()) { }
+
+Player* CharacterIdentity::FindPlayer() const
 {
-    explicit CharacterIdentity(Player const& player)
-        : Guid(player.GetGUID()), CreatedAt(player.GetCreationTime().count()) { }
+    Player* player = ObjectAccessor::FindPlayer(Guid);
+    if (player && player->GetCreationTime().count() == CreatedAt)
+        return player;
 
-    Player* FindPlayer() const
-    {
-        Player* player = ObjectAccessor::FindPlayer(Guid);
-        if (player && player->GetCreationTime().count() == CreatedAt)
-            return player;
+    return nullptr;
+}
 
-        return nullptr;
-    }
-
-    bool operator<(CharacterIdentity const& other) const
-    {
-        return std::tie(Guid, CreatedAt) < std::tie(other.Guid, other.CreatedAt);
-    }
-
-    bool operator==(CharacterIdentity const&) const = default;
-
-    ObjectGuid Guid;
-    int64 CreatedAt;
-};
+bool CharacterIdentity::operator<(CharacterIdentity const& other) const
+{
+    return std::tie(Guid, CreatedAt) < std::tie(other.Guid, other.CreatedAt);
+}
 
 bool IsHuman(Player* player)
 {
@@ -77,14 +73,40 @@ bool IsBot(Player* player)
         sPlayerbotsMgr.GetPlayerbotAI(player);
 }
 
-struct MemoryLocation
+Player* GetCommandPlayer(ChatHandler* handler)
 {
-    uint32 MapId = 0;
-    uint32 InstanceId = 0;
-    uint8 Difficulty = 0;
-    uint32 ZoneId = 0;
-};
+    Player* player = handler->GetPlayer();
+    if (IsHuman(player))
+        return player;
 
+    handler->SendErrorMessage("Companion commands require a manually controlled player character.");
+    return nullptr;
+}
+
+bool WriteRelationship(CharacterIdentity owner, CompanionTransaction transaction, std::string message,
+    std::function<void()> onSaved)
+{
+    WriteCallbacks.AddCallback(CompanionDatabase.AsyncCommitTransaction(transaction))
+        .AfterComplete([owner, message = std::move(message), onSaved = std::move(onSaved)](bool success)
+        {
+            if (success && onSaved)
+                onSaved();
+
+            Player* player = owner.FindPlayer();
+            if (!IsHuman(player))
+                return;
+
+            ChatHandler reply(player->GetSession());
+            if (!success)
+                reply.SendSysMessage("Could not save the companion change. Please try again.");
+            else if (!message.empty())
+                reply.SendSysMessage(message);
+        });
+    return true;
+}
+
+namespace
+{
 MemoryLocation GetMemoryLocation(WorldObject const& source)
 {
     Map const* map = source.GetMap();
@@ -103,13 +125,6 @@ std::string DescribeAdventure(MemoryLocation const& location)
             name = map->name[DEFAULT_LOCALE];
 
     return (name && *name) ? Acore::StringFormat("Adventured together in {}.", name) : "Adventured together.";
-}
-
-TransactionCallback CommitStatement(CompanionPreparedStatement* statement)
-{
-    auto transaction = std::make_shared<Transaction<CompanionConnection>>();
-    transaction->Append(statement);
-    return CompanionDatabase.AsyncCommitTransaction(transaction);
 }
 
 class PartyLoyaltyTracker
@@ -248,7 +263,8 @@ private:
         Seconds const lastSeen = session.LastSeenOn;
         auto const sessionCutoff = (session.StartedOn - RejoinGrace).count();
         auto transaction = std::make_shared<Transaction<CompanionConnection>>();
-        if (session.LastSavedOn == 0s)
+        bool const firstSave = session.LastSavedOn == 0s;
+        if (firstSave)
         {
             MemoryLocation const& location = session.LastLocation;
             auto* memory = CompanionDatabase.GetPreparedStatement(COMPANION_INS_ADVENTURE_MEMORY);
@@ -263,9 +279,18 @@ private:
             owner.Guid.GetCounter(), owner.CreatedAt, bot.Guid.GetCounter(), bot.CreatedAt,
             lastSeen.count(), session.RecruitedOn);
         transaction->Append(statement);
+        if (firstSave)
+        {
+            AppendFirstDungeon(transaction, owner, bot);
+            AppendMilestone(transaction, owner, bot, BondMilestone::Trusted, 50, lastSeen.count(),
+                session.LastLocation, "Our time adventuring together earned a trusted bond.", session.RecruitedOn);
+            AppendMilestone(transaction, owner, bot, BondMilestone::Devoted, 80, lastSeen.count(),
+                session.LastLocation, "Our shared adventures forged a devoted partnership.", session.RecruitedOn);
+        }
         session.SavePending = true;
+        bool const considerOuting = firstSave && roll_chance_i(25);
         WriteCallbacks.AddCallback(CompanionDatabase.AsyncCommitTransaction(transaction))
-            .AfterComplete([this, pair, startedAt = session.StartedAt, lastSeen](bool success)
+            .AfterComplete([this, pair, startedAt = session.StartedAt, lastSeen, considerOuting](bool success)
             {
                 auto const current = _sessions.find(pair);
                 if (current == _sessions.end() || current->second.StartedAt != startedAt)
@@ -273,7 +298,11 @@ private:
 
                 current->second.SavePending = false;
                 if (success)
+                {
                     current->second.LastSavedOn = lastSeen;
+                    if (considerOuting)
+                        MaybeOfferOuting(pair.first, pair.second, current->second.RecruitedOn, lastSeen.count());
+                }
             });
     }
 
@@ -282,38 +311,6 @@ private:
 };
 
 PartyLoyaltyTracker PartyLoyalty;
-
-Player* GetCommandPlayer(ChatHandler* handler)
-{
-    Player* player = handler->GetPlayer();
-    if (IsHuman(player))
-        return player;
-
-    handler->SendErrorMessage("Companion commands require a manually controlled player character.");
-    return nullptr;
-}
-
-bool WriteRelationship(CharacterIdentity owner, CompanionPreparedStatement* statement, std::string message,
-    std::function<void()> onSaved)
-{
-    WriteCallbacks.AddCallback(CommitStatement(statement))
-        .AfterComplete([owner, message = std::move(message), onSaved = std::move(onSaved)](bool success)
-        {
-            if (success)
-                onSaved();
-
-            Player* player = owner.FindPlayer();
-            if (!IsHuman(player))
-                return;
-
-            ChatHandler reply(player->GetSession());
-            if (success)
-                reply.SendSysMessage(message);
-            else
-                reply.SendSysMessage("Could not save the companion change. Please try again.");
-        });
-    return true;
-}
 
 Player* GetTargetBot(ChatHandler* handler, Player* owner, Optional<PlayerIdentifier> const& target)
 {
@@ -339,10 +336,13 @@ bool HandleAdd(ChatHandler* handler, Optional<PlayerIdentifier> target)
 
     CharacterIdentity const owner(*player);
     CharacterIdentity const companion(*bot);
+    auto const createdAt = companion.CreatedAt;
     auto* statement = CompanionDatabase.GetPreparedStatement(COMPANION_INS_RELATIONSHIP);
     statement->SetArguments(owner.Guid.GetCounter(), owner.CreatedAt, companion.Guid.GetCounter(),
-        companion.CreatedAt, companion.CreatedAt, companion.CreatedAt, companion.CreatedAt, companion.CreatedAt);
-    return WriteRelationship(owner, statement, Acore::StringFormat("{} is on your companion list.", bot->GetName()),
+        createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt);
+    auto transaction = std::make_shared<Transaction<CompanionConnection>>();
+    transaction->Append(statement);
+    return WriteRelationship(owner, transaction, Acore::StringFormat("{} is on your companion list.", bot->GetName()),
         [owner, companion] { PartyLoyalty.OnRecruit(owner, companion); });
 }
 
@@ -536,27 +536,25 @@ bool HandleRemove(ChatHandler* handler, Variant<ObjectGuid::LowType, PlayerIdent
         return false;
 
     CharacterIdentity const owner(*player);
-    if (target.holds_alternative<PlayerIdentifier>())
-    {
-        PlayerIdentifier const& companion = target.get<PlayerIdentifier>();
-        auto* statement = CompanionDatabase.GetPreparedStatement(COMPANION_DEL_RELATIONSHIP);
-        statement->SetArguments(owner.Guid.GetCounter(), owner.CreatedAt, companion.GetGUID().GetCounter());
-        return WriteRelationship(owner, statement,
-            Acore::StringFormat("{} is no longer on your companion list.", companion.GetName()),
-            [owner, guid = companion.GetGUID()] { PartyLoyalty.OnRemove(owner, guid); });
-    }
-
-    auto const botGuid = target.get<ObjectGuid::LowType>();
+    bool const named = target.holds_alternative<PlayerIdentifier>();
+    auto const botGuid = named ?
+        target.get<PlayerIdentifier>().GetGUID().GetCounter() : target.get<ObjectGuid::LowType>();
     if (!botGuid)
     {
         handler->SendErrorMessage("Use a companion name or character ID from .companion list.");
         return false;
     }
 
-    auto* statement = CompanionDatabase.GetPreparedStatement(COMPANION_DEL_RELATIONSHIP);
-    statement->SetArguments(owner.Guid.GetCounter(), owner.CreatedAt, botGuid);
-    return WriteRelationship(owner, statement,
-        Acore::StringFormat("Character {} is no longer on your companion list.", botGuid),
+    auto transaction = std::make_shared<Transaction<CompanionConnection>>();
+    for (auto const type : { COMPANION_DEL_LINEUP_BOT, COMPANION_DEL_RELATIONSHIP })
+    {
+        auto* statement = CompanionDatabase.GetPreparedStatement(type);
+        statement->SetArguments(owner.Guid.GetCounter(), owner.CreatedAt, botGuid);
+        transaction->Append(statement);
+    }
+    std::string const name = named ? target.get<PlayerIdentifier>().GetName() :
+        Acore::StringFormat("Character {}", botGuid);
+    return WriteRelationship(owner, transaction, Acore::StringFormat("{} is no longer on your companion list.", name),
         [owner, guid = ObjectGuid::Create<HighGuid::Player>(botGuid)] { PartyLoyalty.OnRemove(owner, guid); });
 }
 
@@ -567,13 +565,18 @@ public:
 
     ChatCommandTable GetCommands() const override
     {
-        static ChatCommandTable const companions = {
-            { "add", HandleAdd, SEC_PLAYER, Console::No },
-            { "list", HandleList, SEC_PLAYER, Console::No },
-            { "info", HandleInfo, SEC_PLAYER, Console::No },
-            { "dismiss", HandleDismiss, SEC_PLAYER, Console::No },
-            { "remove", HandleRemove, SEC_PLAYER, Console::No }
-        };
+        static ChatCommandTable const companions = []
+        {
+            ChatCommandTable commands = {
+                { "add", HandleAdd, SEC_PLAYER, Console::No },
+                { "list", HandleList, SEC_PLAYER, Console::No },
+                { "info", HandleInfo, SEC_PLAYER, Console::No },
+                { "dismiss", HandleDismiss, SEC_PLAYER, Console::No },
+                { "remove", HandleRemove, SEC_PLAYER, Console::No }
+            };
+            AddSocialCommands(commands);
+            return commands;
+        }();
         return { { "companion", companions } };
     }
 };
@@ -585,12 +588,19 @@ struct EncounterMemory
     std::string Summary;
 };
 
-void RecordEncounter(Unit const& source, Group const* creditedGroup, EncounterMemory const& boss,
-    Optional<EncounterMemory> const& completion = std::nullopt)
+using CompanionPair = std::pair<CharacterIdentity, CharacterIdentity>;
+
+std::vector<CompanionPair> GetPresentPairs(Map const& map, Group const* creditedGroup = nullptr,
+    Unit const* source = nullptr, bool wiped = false)
 {
-    Map const& map = *source.GetMap();
-    std::map<Group const*, std::vector<CharacterIdentity>> ownersByGroup;
-    std::map<Group const*, std::vector<CharacterIdentity>> botsByGroup;
+    struct Participants
+    {
+        std::vector<CharacterIdentity> Owners;
+        std::vector<CharacterIdentity> Bots;
+        bool HasSurvivor = false;
+    };
+
+    std::map<Group const*, Participants> groups;
     for (auto const& member : map.GetPlayers())
     {
         Player* player = member.GetSource();
@@ -601,15 +611,34 @@ void RecordEncounter(Unit const& source, Group const* creditedGroup, EncounterMe
         if (!group || group->isBGGroup() || group->isBFGroup() || (creditedGroup && group != creditedGroup))
             continue;
 
-        if (!map.IsDungeon() && (!player->InSamePhase(&source) || !player->IsAtGroupRewardDistance(&source)))
+        if (source && !map.IsDungeon() &&
+            (!player->InSamePhase(source) || !player->IsAtGroupRewardDistance(source)))
             continue;
 
+        Participants& participants = groups[group];
+        participants.HasSurvivor |= player->IsAlive();
         if (IsBot(player))
-            botsByGroup[group].emplace_back(*player);
+            participants.Bots.emplace_back(*player);
         else if (IsHuman(player) && !player->GetSession()->IsSocketClosed())
-            ownersByGroup[group].emplace_back(*player);
+            participants.Owners.emplace_back(*player);
     }
 
+    std::vector<CompanionPair> pairs;
+    for (auto const& [group, participants] : groups)
+    {
+        if (wiped && participants.HasSurvivor)
+            continue;
+
+        for (CharacterIdentity const& owner : participants.Owners)
+            for (CharacterIdentity const& bot : participants.Bots)
+                pairs.emplace_back(owner, bot);
+    }
+    return pairs;
+}
+
+void RecordEncounter(Unit const& source, Group const* creditedGroup, EncounterMemory const& boss,
+    Optional<EncounterMemory> const& completion = std::nullopt)
+{
     auto transaction = std::make_shared<Transaction<CompanionConnection>>();
     MemoryLocation const location = GetMemoryLocation(source);
     auto const occurredAt = GameTime::GetGameTime().count();
@@ -622,19 +651,18 @@ void RecordEncounter(Unit const& source, Group const* creditedGroup, EncounterMe
         transaction->Append(statement);
     };
 
-    for (auto const& [group, owners] : ownersByGroup)
+    for (auto const& [owner, bot] : GetPresentPairs(*source.GetMap(), creditedGroup, &source))
     {
-        auto const bots = botsByGroup.find(group);
-        if (bots == botsByGroup.end())
+        append(owner, bot, boss);
+        if (!completion)
             continue;
 
-        for (CharacterIdentity const& owner : owners)
-            for (CharacterIdentity const& bot : bots->second)
-            {
-                append(owner, bot, boss);
-                if (completion)
-                    append(owner, bot, *completion);
-            }
+        append(owner, bot, *completion);
+        AppendFirstDungeon(transaction, owner, bot);
+        auto* request = CompanionDatabase.GetPreparedStatement(COMPANION_UPD_COMPLETE_REQUEST);
+        request->SetArguments(owner.Guid.GetCounter(), owner.CreatedAt, bot.Guid.GetCounter(),
+            bot.CreatedAt, location.MapId);
+        transaction->Append(request);
     }
 
     // Encounter hooks can run on map threads. Only the owned SQL transaction leaves this call.
@@ -642,11 +670,116 @@ void RecordEncounter(Unit const& source, Group const* creditedGroup, EncounterMe
         CompanionDatabase.CommitTransaction(transaction);
 }
 
+class WipeVictoryTracker
+{
+public:
+    void OnStateChanging(Map const& map, uint32 bossId, EncounterState oldState, EncounterState newState)
+    {
+        EncounterKey const key = { map.GetInstanceId(), map.GetId(), bossId };
+        if (oldState == IN_PROGRESS && (newState == FAIL || newState == NOT_STARTED))
+        {
+            auto const pairs = GetPresentPairs(map, nullptr, nullptr, true);
+            if (!pairs.empty())
+            {
+                std::lock_guard lock(_mutex);
+                _wiped[key].insert(pairs.begin(), pairs.end());
+            }
+        }
+        else if (newState == DONE && oldState != DONE && oldState != TO_BE_DECIDED)
+        {
+            std::lock_guard lock(_mutex);
+            if (_wiped.contains(key))
+                _victories.insert_or_assign(key, GetPresentPairs(map));
+        }
+    }
+
+    void RemoveInstance(uint32 instanceId)
+    {
+        std::lock_guard lock(_mutex);
+        std::erase_if(_wiped, [instanceId](auto const& entry) { return entry.first.InstanceId == instanceId; });
+        std::erase_if(_victories, [instanceId](auto const& entry) { return entry.first.InstanceId == instanceId; });
+    }
+
+    void Update()
+    {
+        decltype(_victories) victories;
+        {
+            std::lock_guard lock(_mutex);
+            if (_victories.empty())
+                return;
+
+            victories.swap(_victories);
+        }
+
+        auto transaction = std::make_shared<Transaction<CompanionConnection>>();
+        for (auto const& [key, pairs] : victories)
+        {
+            Map const* map = sMapMgr->FindMap(key.MapId, key.InstanceId);
+            InstanceMap const* instance = map ? map->ToInstanceMap() : nullptr;
+            InstanceScript const* script = instance ? instance->GetInstanceScript() : nullptr;
+            // Some scripts can reject DONE after the pre-state hook. Check the actual state after map updates.
+            if (!script || script->GetBossState(key.BossId) != DONE)
+                continue;
+
+            std::set<CompanionPair> wiped;
+            {
+                std::lock_guard lock(_mutex);
+                auto entry = _wiped.extract(key);
+                if (entry.empty())
+                    continue;
+                wiped = std::move(entry.mapped());
+            }
+
+            MemoryLocation const location = { key.MapId, key.InstanceId, uint8(map->GetDifficulty()), 0 };
+            auto const occurredAt = GameTime::GetGameTime().count();
+            auto const summary = Acore::StringFormat(
+                "We rallied after a wipe and defeated the encounter together in {}.", map->GetMapName());
+            for (auto const& [owner, bot] : pairs)
+                if (wiped.contains({ owner, bot }))
+                    AppendMilestone(transaction, owner, bot, BondMilestone::WipeVictory, 0, occurredAt,
+                        location, summary);
+        }
+
+        if (transaction->GetSize())
+            CompanionDatabase.CommitTransaction(transaction);
+    }
+
+private:
+    struct EncounterKey
+    {
+        uint32 InstanceId;
+        uint32 MapId;
+        uint32 BossId;
+
+        auto operator<=>(EncounterKey const&) const = default;
+    };
+
+    std::mutex _mutex;
+    std::map<EncounterKey, std::set<CompanionPair>> _wiped;
+    std::map<EncounterKey, std::vector<CompanionPair>> _victories;
+};
+
+WipeVictoryTracker WipeVictories;
+
 class CompanionEncounterScript : public GlobalScript
 {
 public:
-    CompanionEncounterScript()
-        : GlobalScript("CompanionEncounterScript", { GLOBALHOOK_ON_AFTER_UPDATE_ENCOUNTER_STATE }) { }
+    CompanionEncounterScript() : GlobalScript("CompanionEncounterScript", {
+        GLOBALHOOK_ON_AFTER_UPDATE_ENCOUNTER_STATE,
+        GLOBALHOOK_ON_BEFORE_SET_BOSS_STATE,
+        GLOBALHOOK_ON_INSTANCEID_REMOVED
+    }) { }
+
+    void OnBeforeSetBossState(uint32 id, EncounterState newState, EncounterState oldState, Map* map) override
+    {
+        if (map && map->IsDungeon() && map->GetInstanceId())
+            WipeVictories.OnStateChanging(*map, id, oldState, newState);
+    }
+
+    void OnInstanceIdRemoved(uint32 instanceId) override
+    {
+        WipeVictories.RemoveInstance(instanceId);
+    }
 
     void OnAfterUpdateEncounterState(Map* map, EncounterCreditType type, uint32 creditEntry, Unit* source,
         Difficulty /*difficulty*/, DungeonEncounterList const* encounters, uint32 dungeonCompleted,
@@ -725,6 +858,7 @@ public:
         WriteCallbacks.ProcessReadyCallbacks();
         QueryCallbacks.ProcessReadyCallbacks();
         PartyLoyalty.Update();
+        WipeVictories.Update();
     }
 };
 }

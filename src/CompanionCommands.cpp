@@ -558,6 +558,40 @@ bool HandleRemove(ChatHandler* handler, Variant<ObjectGuid::LowType, PlayerIdent
         [owner, guid = ObjectGuid::Create<HighGuid::Player>(botGuid)] { PartyLoyalty.OnRemove(owner, guid); });
 }
 
+bool HandleHelp(ChatHandler* handler)
+{
+    handler->SendSysMessage(
+        "Companion roster\n"
+        ".companion help — show this list\n"
+        ".companion add [name] — recruit a bot in your group\n"
+        ".companion list — show your recruits\n"
+        ".companion info <name> — see loyalty and recent memories\n"
+        ".companion invite <name> — invite an online recruit\n"
+        ".companion dismiss [name] — remove a recruit from your party\n"
+        ".companion remove <name or character ID> — erase the relationship\n"
+        "For add and dismiss, omit the name to use your selected target.\n"
+        "Journal and traditions\n"
+        ".companion journal <name> [category] [page]\n"
+        "Categories are all, adventure, boss, dungeon, milestone, tradition, and pinned.\n"
+        ".companion pin <name> <memory ID>\n"
+        ".companion unpin <name> <memory ID>\n"
+        ".companion tradition list <name>\n"
+        ".companion tradition set <name> <kind> <text>\n"
+        ".companion tradition clear <name> <kind>\n"
+        "Tradition kinds are nickname, joke, and rendezvous.\n"
+        "Saved lineups\n"
+        ".companion lineup list\n"
+        ".companion lineup save <lineup>\n"
+        ".companion lineup show <lineup>\n"
+        ".companion lineup invite <lineup>\n"
+        ".companion lineup remove <lineup>\n"
+        "Dungeon outings\n"
+        ".companion request show <name>\n"
+        ".companion request accept <name>\n"
+        ".companion request decline <name>");
+    return true;
+}
+
 class CompanionCommandScript : public CommandScript
 {
 public:
@@ -568,6 +602,7 @@ public:
         static ChatCommandTable const companions = []
         {
             ChatCommandTable commands = {
+                { "help", HandleHelp, SEC_PLAYER, Console::No },
                 { "add", HandleAdd, SEC_PLAYER, Console::No },
                 { "list", HandleList, SEC_PLAYER, Console::No },
                 { "info", HandleInfo, SEC_PLAYER, Console::No },

@@ -91,6 +91,7 @@ Worldserver stops during startup if it cannot open or initialize the companion d
 
 ## In-game commands
 
+- `.companion help` shows the available commands and their arguments in game.
 - `.companion add [name]` recruits an online bot in your group. Omit the name to use your selected target.
 - `.companion list` shows this character’s recruits and whether each is in your group, online as a bot, or unavailable.
 - `.companion info <name>` shows the companion's loyalty, relationship tier, and five most recent shared memories.

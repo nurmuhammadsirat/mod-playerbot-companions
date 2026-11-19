@@ -4,6 +4,10 @@ Each player character can keep a persistent roster of existing playerbots. Bring
 through Playerbots, then recruit it with `.companion add`. Your roster, loyalty, journal, saved
 lineups, and outing requests live in a dedicated MySQL database and survive worldserver restarts.
 
+## DISCLAIMER
+
+This module is made with AI assistance as I have zero c++ experience.
+
 ## Dependencies
 
 - AzerothCore WotLK on the `Playerbot` branch, with `mod-playerbots` installed and enabled.

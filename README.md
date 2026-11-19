@@ -42,6 +42,21 @@ priority for the current map, including relevant milestone and tradition summari
 belong to the addressed bot, or the primary bot in a multi-bot reply. Pinning changes the in-game
 journal view. Outing suggestions are delivered privately by worldserver.
 
+#### Traditions in party chat
+
+To let companions save traditions from conversation, enable
+`LLMChatter.AdditionalContext.PartyReplies = 1` in `mod_llm_chatter.conf`
+and restart the Python bridge. The account in `AdditionalContext.DatabaseInfo`
+also needs `INSERT` and `DELETE` on `playerbot_companion_memories`. The
+companion database stores chat-created traditions alongside those set manually.
+
+Try saying “Darrin, could we make the Goldshire inn our usual meeting spot?”
+Wait for Darrin's question, then reply `yes`. If several bots are in the party,
+address the companion by name in both messages, such as `yes, Darrin`. The
+question expires in two minutes. The same flow works for a nickname or running
+joke and asks before replacing a saved tradition. `.companion tradition list`
+shows the saved entry. This feature uses party chat.
+
 `mod-solo-party-xp` can be used alongside this module and continues to calculate XP from actual group membership.
 
 ## Installation

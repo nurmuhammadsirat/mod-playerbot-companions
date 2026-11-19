@@ -125,5 +125,89 @@ class CompanionContextTests(unittest.TestCase):
         self.assertIn('familiarity has faded with time apart', context)
 
 
+class ChatTraditionTests(unittest.TestCase):
+    def setUp(self):
+        pending = patch.object(companions, '_pending', {})
+        pending.start()
+        self.addCleanup(pending.stop)
+        self.key = (42, 100, 77, 200)
+        self.journal = MagicMock()
+        self.journal.__enter__.return_value = self.journal
+        self.cursor = self.journal.cursor.return_value.__enter__.return_value
+        self.connect = MagicMock(return_value=self.journal)
+        self.ask_model = MagicMock(return_value=(
+            '{"kind":"rendezvous","text":"the Goldshire inn"}'
+        ))
+        self.was_delivered = MagicMock(return_value=True)
+
+    def reply(self, message, event_id=1, group_id=9, bot_count=1, key=None):
+        return companions._handle_party_reply(
+            self.connect, key or self.key, 'Darrin', event_id=event_id,
+            group_id=group_id, message=message, addressed=True,
+            bot_count=bot_count, ask_model=self.ask_model,
+            was_delivered=self.was_delivered,
+        )
+
+    def test_save_requires_delivered_confirmation_for_the_same_pair_and_group(self):
+        self.cursor.fetchone.side_effect = [(1,), None, (1,), None]
+        prompt = self.reply('Make the Goldshire inn our usual spot')
+        self.assertIn('the Goldshire inn', prompt)
+        self.journal.commit.assert_not_called()
+        self.assertIsNone(self.reply('yes', 2, group_id=10))
+        self.assertIsNone(self.reply('yes', 2, key=(43, 100, 77, 200)))
+        self.was_delivered.return_value = False
+        self.assertIsNone(self.reply('yes', 2))
+        self.journal.commit.assert_not_called()
+        self.was_delivered.return_value = True
+        self.assertIn('put it in our journal', self.reply('Yes!', 3))
+        self.was_delivered.assert_called_with(1)
+        query, args = self.cursor.execute.call_args.args
+        self.assertIn('INSERT INTO playerbot_companion_memories', query)
+        self.assertEqual(args, (*self.key, 3,
+                                'Our favorite place to regroup is "the Goldshire inn".'))
+        self.journal.commit.assert_called_once()
+        self.assertIsNone(self.reply('yes', 4))
+
+    def test_multiple_bots_require_named_proposal_and_confirmation(self):
+        self.cursor.fetchone.side_effect = [(1,), None, (1,), None]
+        self.assertIsNone(self.reply('Make the Goldshire inn our spot', bot_count=2))
+        self.ask_model.assert_not_called()
+        self.assertIn('yes, Darrin', self.reply(
+            'Darrin, make the Goldshire inn our spot', 2, bot_count=2,
+        ))
+        self.assertIsNone(self.reply('yes', 3, bot_count=2))
+        self.assertIn('put it in our journal', self.reply('Yes, Darrin!', 4, bot_count=2))
+
+    def test_changed_tradition_is_not_overwritten(self):
+        self.cursor.fetchone.side_effect = [(1,), (11, 'Old'), (1,), (12, 'New')]
+        self.assertIn('replace', self.reply('Make the Goldshire inn our spot'))
+        self.assertIn('journal has changed', self.reply('yes', 2))
+        self.assertEqual(self.cursor.execute.call_count, 4)
+        self.journal.rollback.assert_called_once()
+        self.journal.commit.assert_not_called()
+
+    def test_explicit_replacement_deletes_old_entry_in_same_transaction(self):
+        old = (11, 'Old')
+        self.cursor.fetchone.side_effect = [(1,), old, (1,), old]
+        self.assertIn('replace', self.reply('Make the Goldshire inn our spot'))
+        self.assertIn('put it in our journal', self.reply('yes', 2))
+        deletion, insertion = self.cursor.execute.call_args_list[-2:]
+        self.assertIn('DELETE FROM playerbot_companion_memories', deletion.args[0])
+        self.assertEqual(deletion.args[1], (11,))
+        self.assertIn('INSERT INTO playerbot_companion_memories', insertion.args[0])
+        self.journal.start_transaction.assert_called_once()
+        self.journal.commit.assert_called_once()
+
+    def test_proposal_expires_and_model_cannot_invent_the_value(self):
+        self.assertIsNone(self.reply('Let’s try the Lion’s Pride'))
+        self.connect.assert_not_called()
+        self.cursor.fetchone.side_effect = [(1,), None]
+        with patch.object(companions.time, 'monotonic', return_value=10) as clock:
+            self.assertTrue(self.reply('Make the Goldshire inn our usual spot', 2))
+            clock.return_value += companions._PROPOSAL_SECONDS
+            self.assertIsNone(self.reply('yes', 3))
+        self.journal.commit.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
